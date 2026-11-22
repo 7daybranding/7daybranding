@@ -131,6 +131,7 @@ nav.tabs button.on{color:var(--primary);font-weight:700}
   <section id="view-fixed" class="hidden"></section>
   <!-- 설정 -->
   <section id="view-settings" class="hidden"></section>
+  <section id="view-admin" class="hidden"></section>
 </div>
 
 <button class="fab" id="fab" aria-label="추가" onclick="onFab()">+</button>
@@ -140,6 +141,7 @@ nav.tabs button.on{color:var(--primary);font-weight:700}
   <button data-tab="ledger" onclick="go('ledger')"><span class="ico">✎</span>가계부</button>
   <button data-tab="fixed" onclick="go('fixed')"><span class="ico">⟳</span>고정비 점검</button>
   <button data-tab="settings" onclick="go('settings')"><span class="ico">⚙</span>설정</button>
+  <button data-tab="admin" class="hidden" onclick="go('admin')"><span class="ico">☷</span>관리</button>
 </div></nav>
 
 <div class="modal-bg" id="modalBg" onclick="if(event.target===this)closeModal()">
@@ -173,8 +175,8 @@ function save(){
 }
 
 /* ================== 클라우드 동기화 (claude.ai에서 열었을 때) ==================
-   로그인한 본인만 읽고 쓰는 개인 영역(data/users/<id>/)에 저장 → 휴대폰·PC 어디서 열어도 같은 데이터 */
-const cloud = { col:null, last:{}, busy:false, again:false, timer:null, status:'local' };
+   ledgers/<내 id>/docs/* 에 저장. 접근 규칙: 본인 + 앱 소유자만 읽기, 본인만 쓰기 */
+const cloud = { col:null, root:null, db:null, user:null, owner:false, last:{}, lastSummary:'', busy:false, again:false, timer:null, status:'local' };
 function cloudDocs(){
   const docs = { meta: JSON.stringify({income:state.income, budgets:state.budgets, fixed:state.fixed, sample:!!state.sample}) };
   const months = {};
@@ -182,6 +184,11 @@ function cloudDocs(){
   Object.keys(cloud.last).forEach(k=>{ if(k.startsWith('tx-')) docs[k]='[]'; }); // 비워진 달
   Object.entries(months).forEach(([m,list])=>docs['tx-'+m]=JSON.stringify(list));
   return docs;
+}
+function summary(){
+  const d = diagnose();
+  return { income:state.income||0, fixedMonthly:Math.round(d.total), ratio:d.ratio===null?null:Math.round(d.ratio*10)/10,
+    saving:Math.round(d.saving), fixedCount:activeFixed().length, txCount:state.tx.length, sample:!!state.sample };
 }
 function cloudPush(){
   if(!cloud.col) return;
@@ -195,13 +202,16 @@ async function cloudFlush(){
     const docs = cloudDocs();
     for(const [k,v] of Object.entries(docs)){
       if(cloud.last[k]===v) continue;
-      if(k==='meta') await cloud.col.doc(k).set({json:v});
-      else if(v==='[]') await cloud.col.doc(k).delete();
-      else await cloud.col.doc(k).set({json:v});
+      if(v==='[]') await cloud.col.doc(k).delete(); else await cloud.col.doc(k).set({json:v});
       if(v==='[]') delete cloud.last[k]; else cloud.last[k]=v;
     }
+    const sm = JSON.stringify(summary());
+    if(sm!==cloud.lastSummary){ await cloud.root.set({...JSON.parse(sm), updated:Date.now()}); cloud.lastSummary=sm; }
     setSync('cloud');
-  }catch(e){ setSync('error'); }
+  }catch(e){
+    if(e && e.code==='invalid_argument'){ cloud.col=null; setSync('local'); } // 저장 권한 없음 → 이 기기에만 저장
+    else setSync('error');
+  }
   cloud.busy=false;
   if(cloud.again){ cloud.again=false; cloudFlush(); }
 }
@@ -209,28 +219,98 @@ function setSync(s){ cloud.status=s; const el=document.getElementById('syncBadge
 function syncText(){
   return {cloud:'☁️ 클라우드에 자동 저장 중 (휴대폰·PC 동기화)', error:'⚠️ 클라우드 저장 실패 — 이 기기에는 저장돼 있어요', local:'📱 이 기기 브라우저에만 저장돼요'}[cloud.status];
 }
+function withTimeout(p){ return Promise.race([p, new Promise((_,r)=>setTimeout(()=>r('timeout'),10000))]); }
+function readDocs(snap){ const o={}; snap.docs.forEach(d=>{ if(d.exists && d.data().json) o[d.id]=d.data().json; }); return o; }
+function stateFrom(remote){
+  const meta = JSON.parse(remote.meta); const tx=[];
+  Object.entries(remote).forEach(([k,v])=>{ if(k.startsWith('tx-')) tx.push(...JSON.parse(v)); });
+  return Object.assign(blank(), meta, {tx});
+}
 async function cloudInit(){
   if(!window.claude || !window.claude.use) return;
   try{
     const [db,user] = await Promise.all([claude.use('db'), claude.use('user')]);
     if(!db || !user) return;
     const id = await user.id(); if(!id) return;
-    const col = db.collection('data/users/'+id);
-    const snap = await Promise.race([col.limit(1000).get(), new Promise((_,r)=>setTimeout(()=>r('timeout'),10000))]);
-    const remote = {}; snap.docs.forEach(d=>{ if(d.exists) remote[d.id]=d.data().json; });
-    cloud.col = col;
-    if(remote.meta){
-      const meta = JSON.parse(remote.meta); const tx=[];
-      Object.entries(remote).forEach(([k,v])=>{ if(k.startsWith('tx-')) tx.push(...JSON.parse(v)); });
-      state = Object.assign(blank(), meta, {tx});
-      cloud.last = remote;
-      try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){}
-      setSync('cloud'); render();
-    } else {
-      await cloudFlush(); // 처음: 이 기기 데이터를 클라우드로 올림
+    cloud.db=db; cloud.user=user; cloud.owner = !!(await user.isOwner());
+    if(!cloud.owner && (await user.can('data.write'))===false) return; // 보기 전용 방문자: 이 기기에만 저장
+    const root = db.doc('ledgers/'+id), col = root.collection('docs');
+    let remote = readDocs(await withTimeout(col.limit(1000).get()));
+    let fresh = false;
+    if(!remote.meta){ // 이전 버전 저장 위치에서 옮겨오기
+      try{ const old = readDocs(await withTimeout(db.collection('data/users/'+id).limit(1000).get())); if(old.meta){ remote=old; fresh=true; } }catch(e){}
     }
+    cloud.root=root; cloud.col=col;
+    if(remote.meta){
+      state = stateFrom(remote);
+      if(!fresh) cloud.last = remote;
+      try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){}
+      render();
+    }
+    await cloudFlush();
+    if(cloud.owner) document.querySelector('nav [data-tab="admin"]').classList.remove('hidden');
   }catch(e){ cloud.col=null; setSync('error'); }
 }
+
+/* ================== 관리자 (앱 소유자에게만 보임) ================== */
+let adminCache = null;
+async function renderAdmin(){
+  const el = document.getElementById('view-admin');
+  if(!cloud.owner){ el.innerHTML='<div class="empty">권한이 없어요.</div>'; return; }
+  el.innerHTML = '<div class="empty">사용자 목록을 불러오는 중…</div>';
+  try{
+    const snap = await withTimeout(cloud.db.collection('ledgers').limit(1000).get());
+    const rows = snap.docs.filter(d=>d.exists).map(d=>({id:d.id, ...d.data()})).sort((a,b)=>(b.updated||0)-(a.updated||0));
+    const ps = rows.length ? await cloud.user.profiles(rows.map(r=>r.id)) : {};
+    adminCache = {rows, ps};
+    const real = rows.filter(r=>!r.sample && (r.fixedCount||r.txCount));
+    const avg = real.filter(r=>r.ratio!=null); const avgRatio = avg.length? avg.reduce((a,r)=>a+r.ratio,0)/avg.length : null;
+    el.innerHTML = `
+      <div class="card"><h2>사용 현황</h2><div class="grid2">
+        <div class="stat"><div class="k">사용자</div><div class="v">${rows.length}명</div></div>
+        <div class="stat"><div class="k">실제 입력한 사람</div><div class="v">${real.length}명</div></div>
+        <div class="stat"><div class="k">평균 고정비 비율</div><div class="v">${avgRatio===null?'-':avgRatio.toFixed(0)+'%'}</div></div>
+        <div class="stat"><div class="k">60% 넘는 사람</div><div class="v out">${avg.filter(r=>r.ratio>60).length}명</div></div>
+      </div></div>
+      <div class="card"><h2>사용자별 <small>탭하면 상세</small></h2>
+      ${rows.length? rows.map((r,i)=>`<div class="row" style="cursor:pointer" onclick="openUser(${i})">
+        <div class="l"><div class="name" data-name="${i}"></div>
+          <div class="sub">${r.sample?'<span class="tag">예시만</span>':''}고정비 ${r.fixedCount||0}개 · 기록 ${r.txCount||0}건 · ${r.updated?new Date(r.updated).toLocaleDateString('ko-KR'):''}</div></div>
+        <div class="r"><div class="num">${won(r.fixedMonthly||0)}</div>
+          <div class="small ${r.ratio>60?'out':r.ratio>50?'':'muted'}">${r.ratio!=null?'소득의 '+r.ratio+'%':'소득 미입력'}</div></div></div>`).join('')
+        : '<div class="empty">아직 사용자가 없어요.</div>'}
+      </div>
+      <p class="small muted" style="padding:0 4px">이 탭은 앱 소유자에게만 보여요. 사용자들은 서로의 기록을 볼 수 없어요.</p>`;
+    rows.forEach((r,i)=>{ const n=el.querySelector(`[data-name="${i}"]`); if(n) n.textContent = (ps[r.id]&&ps[r.id].name) || '이름 없는 사용자'; });
+  }catch(e){ el.innerHTML='<div class="empty">불러오지 못했어요. 잠시 후 다시 열어주세요.</div>'; }
+}
+async function openUser(i){
+  const r = adminCache.rows[i]; const name = (adminCache.ps[r.id]&&adminCache.ps[r.id].name) || '이름 없는 사용자';
+  showModal('<div class="empty">불러오는 중…</div>');
+  try{
+    const remote = readDocs(await withTimeout(cloud.db.doc('ledgers/'+r.id).collection('docs').limit(1000).get()));
+    if(!remote.meta){ showModal('<div class="empty">아직 저장된 데이터가 없어요.</div><button class="btn line block" onclick="closeModal()">닫기</button>'); return; }
+    const u = stateFrom(remote);
+    const fx = u.fixed.filter(f=>f.active!==false).sort((a,b)=>monthly(b)-monthly(a));
+    const tot = fx.reduce((a,f)=>a+monthly(f),0);
+    const sav = fx.filter(f=>f.status==='검토'||f.status==='해지').reduce((a,f)=>a+monthly(f),0);
+    const months = {}; u.tx.forEach(t=>{ const m=t.date.slice(0,7); months[m]=months[m]||{i:0,o:0}; months[m][t.type==='in'?'i':'o']+=t.amount; });
+    showModal(`<h3 id="uName"></h3>
+      <div class="grid2" style="margin-bottom:12px">
+        <div class="stat"><div class="k">월 소득</div><div class="v">${won(u.income)}</div></div>
+        <div class="stat"><div class="k">월 고정비</div><div class="v">${won(tot)}</div></div>
+        <div class="stat"><div class="k">고정비 비율</div><div class="v">${u.income?(tot/u.income*100).toFixed(1)+'%':'-'}</div></div>
+        <div class="stat"><div class="k">줄일 수 있는 돈</div><div class="v out">${won(sav)}</div></div>
+      </div>
+      <b>고정비 ${fx.length}개</b>
+      ${fx.map(f=>`<div class="row"><div class="l"><div class="name">${esc(f.name)}</div><div class="sub">${f.status?`<span class="tag s-${f.status}">${f.status}</span>`:'<span class="tag">미점검</span>'}${esc(f.cat)}${f.memo?' · '+esc(f.memo):''}</div></div><div class="r num">${won(f.amount)}${f.cycle==='year'?'/년':''}</div></div>`).join('')||'<div class="empty">없음</div>'}
+      <b style="display:block;margin-top:12px">월별 가계부</b>
+      ${Object.entries(months).sort((a,b)=>b[0].localeCompare(a[0])).map(([m,v])=>`<div class="row"><div class="l">${ymLabel(m)}</div><div class="r small"><span class="in">+${won(v.i)}</span> · <span class="out">-${won(v.o)}</span></div></div>`).join('')||'<div class="empty">기록 없음</div>'}
+      <div class="btns" style="margin-top:14px"><button class="btn line" style="flex:1" onclick="closeModal()">닫기</button></div>`);
+    document.getElementById('uName').textContent = name + (r.sample?' (예시 데이터)':'');
+  }catch(e){ showModal('<div class="empty">불러오지 못했어요.</div><button class="btn line block" onclick="closeModal()">닫기</button>'); }
+}
+
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 
 /* ================== 유틸 ================== */
@@ -305,12 +385,12 @@ function diagnose(){
 function go(t){ tab=t; render(); window.scrollTo(0,0); }
 function render(){
   document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===tab));
-  ['home','ledger','fixed','settings'].forEach(v=>document.getElementById('view-'+v).classList.toggle('hidden',v!==tab));
-  document.getElementById('pageTitle').textContent = {home:'대시보드',ledger:'가계부',fixed:'고정비 점검',settings:'설정'}[tab];
+  ['home','ledger','fixed','settings','admin'].forEach(v=>document.getElementById('view-'+v).classList.toggle('hidden',v!==tab));
+  document.getElementById('pageTitle').textContent = {home:'대시보드',ledger:'가계부',fixed:'고정비 점검',settings:'설정',admin:'사용자 관리'}[tab];
   document.getElementById('monthLabel').textContent = ymLabel(ym);
-  document.getElementById('monthNav').classList.toggle('hidden', tab==='fixed' || tab==='settings');
-  document.getElementById('fab').classList.toggle('hidden', tab==='settings' || (tab==='home' && isEmpty()));
-  ({home:renderHome,ledger:renderLedger,fixed:renderFixed,settings:renderSettings})[tab]();
+  document.getElementById('monthNav').classList.toggle('hidden', tab==='fixed' || tab==='settings' || tab==='admin');
+  document.getElementById('fab').classList.toggle('hidden', tab==='settings' || tab==='admin' || (tab==='home' && isEmpty()));
+  ({home:renderHome,ledger:renderLedger,fixed:renderFixed,settings:renderSettings,admin:renderAdmin})[tab]();
 }
 
 function isEmpty(){ return !state.fixed.length && !state.tx.length && !state.income; }
@@ -338,7 +418,7 @@ function renderWelcome(){
       <button class="btn block" onclick="startFresh()">내 고정비 등록 시작하기</button>
       <button class="btn line block" style="margin-top:8px" onclick="loadSample(true)">예시 데이터로 먼저 둘러보기</button>
     </div>
-    <p class="small muted" style="text-align:center;padding:0 8px">🔒 입력한 내용은 나만 볼 수 있어요. 링크를 공유한 사람도 내 기록은 보지 못해요.</p>`;
+    <p class="small muted" style="text-align:center;padding:0 8px">🔒 입력한 내용은 <b>나와 이 앱 운영자만</b> 볼 수 있어요. 다른 사용자에게는 보이지 않아요. 운영자는 고정비 점검·상담을 위해 입력 내용을 확인할 수 있어요.</p>`;
 }
 function startFresh(){
   const v = parseNum(document.getElementById('wIncome').value);
@@ -494,7 +574,7 @@ function renderSettings(){
     <div class="card">
       <h2>데이터</h2>
       <p class="small" style="margin-top:0" id="syncBadge">${syncText()}</p>
-      <p class="small muted">가끔 백업 파일(JSON)을 받아두면 더 안전해요.</p>
+      <p class="small muted">입력한 내용은 나와 이 앱 운영자만 볼 수 있어요. 가끔 백업 파일(JSON)을 받아두면 더 안전해요.</p>
       <div class="btns">
         <button class="btn line sm" onclick="exportJSON()">백업 (JSON)</button>
         <button class="btn line sm" onclick="document.getElementById('importFile').click()">복원</button>
