@@ -164,7 +164,70 @@ function load(){
   try{ const s = JSON.parse(localStorage.getItem(KEY)); if(s && s.fixed && s.tx) return Object.assign(blank(), s); }catch(e){}
   return blank();
 }
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){ toast('저장 공간에 접근할 수 없어요'); } }
+function save(){
+  try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){ if(!cloud.col) toast('저장 공간에 접근할 수 없어요'); }
+  cloudPush();
+}
+
+/* ================== 클라우드 동기화 (claude.ai에서 열었을 때) ==================
+   로그인한 본인만 읽고 쓰는 개인 영역(data/users/<id>/)에 저장 → 휴대폰·PC 어디서 열어도 같은 데이터 */
+const cloud = { col:null, last:{}, busy:false, again:false, timer:null, status:'local' };
+function cloudDocs(){
+  const docs = { meta: JSON.stringify({income:state.income, budgets:state.budgets, fixed:state.fixed}) };
+  const months = {};
+  state.tx.forEach(t=>{ const m=t.date.slice(0,7); (months[m]=months[m]||[]).push(t); });
+  Object.keys(cloud.last).forEach(k=>{ if(k.startsWith('tx-')) docs[k]='[]'; }); // 비워진 달
+  Object.entries(months).forEach(([m,list])=>docs['tx-'+m]=JSON.stringify(list));
+  return docs;
+}
+function cloudPush(){
+  if(!cloud.col) return;
+  clearTimeout(cloud.timer);
+  cloud.timer = setTimeout(cloudFlush, 600);
+}
+async function cloudFlush(){
+  if(cloud.busy){ cloud.again=true; return; }
+  cloud.busy=true;
+  try{
+    const docs = cloudDocs();
+    for(const [k,v] of Object.entries(docs)){
+      if(cloud.last[k]===v) continue;
+      if(k==='meta') await cloud.col.doc(k).set({json:v});
+      else if(v==='[]') await cloud.col.doc(k).delete();
+      else await cloud.col.doc(k).set({json:v});
+      if(v==='[]') delete cloud.last[k]; else cloud.last[k]=v;
+    }
+    setSync('cloud');
+  }catch(e){ setSync('error'); }
+  cloud.busy=false;
+  if(cloud.again){ cloud.again=false; cloudFlush(); }
+}
+function setSync(s){ cloud.status=s; const el=document.getElementById('syncBadge'); if(el) el.innerHTML=syncText(); }
+function syncText(){
+  return {cloud:'☁️ 클라우드에 자동 저장 중 (휴대폰·PC 동기화)', error:'⚠️ 클라우드 저장 실패 — 이 기기에는 저장돼 있어요', local:'📱 이 기기 브라우저에만 저장돼요'}[cloud.status];
+}
+async function cloudInit(){
+  if(!window.claude || !window.claude.use) return;
+  try{
+    const [db,user] = await Promise.all([claude.use('db'), claude.use('user')]);
+    if(!db || !user) return;
+    const id = await user.id(); if(!id) return;
+    const col = db.collection('data/users/'+id);
+    const snap = await Promise.race([col.limit(1000).get(), new Promise((_,r)=>setTimeout(()=>r('timeout'),10000))]);
+    const remote = {}; snap.docs.forEach(d=>{ if(d.exists) remote[d.id]=d.data().json; });
+    cloud.col = col;
+    if(remote.meta){
+      const meta = JSON.parse(remote.meta); const tx=[];
+      Object.entries(remote).forEach(([k,v])=>{ if(k.startsWith('tx-')) tx.push(...JSON.parse(v)); });
+      state = Object.assign(blank(), meta, {tx});
+      cloud.last = remote;
+      try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){}
+      setSync('cloud'); render();
+    } else {
+      await cloudFlush(); // 처음: 이 기기 데이터를 클라우드로 올림
+    }
+  }catch(e){ cloud.col=null; setSync('error'); }
+}
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 
 /* ================== 유틸 ================== */
@@ -393,7 +456,8 @@ function renderSettings(){
     </div>
     <div class="card">
       <h2>데이터</h2>
-      <p class="small muted" style="margin-top:0">모든 기록은 이 기기의 브라우저에만 저장돼요. 기기를 바꾸거나 브라우저 데이터를 지우기 전에 백업하세요.</p>
+      <p class="small" style="margin-top:0" id="syncBadge">${syncText()}</p>
+      <p class="small muted">가끔 백업 파일(JSON)을 받아두면 더 안전해요.</p>
       <div class="btns">
         <button class="btn line sm" onclick="exportJSON()">백업 (JSON)</button>
         <button class="btn line sm" onclick="document.getElementById('importFile').click()">복원</button>
@@ -531,7 +595,13 @@ function saveBudgets(){
 }
 
 /* ================== 데이터 관리 ================== */
-function download(name, text, type){
+async function download(name, text, type){
+  const dl = window.claude && window.claude.use ? await claude.use('downloads') : null;
+  if(dl){
+    try{ await dl.save({filename:name, data:text}); toast('파일을 저장했어요'); }
+    catch(e){ if(e && e.code!=='declined') toast('이 화면에서는 파일 저장이 안 돼요'); }
+    return;
+  }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 function exportJSON(){ download(`가계부백업_${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(state,null,2), 'application/json'); }
@@ -575,6 +645,7 @@ function loadSample(){
 
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
 render();
+cloudInit();
 </script>
 </body>
 </html>
